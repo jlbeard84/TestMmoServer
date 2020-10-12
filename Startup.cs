@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -15,10 +16,12 @@ namespace TestMmoServer
 {
     public class Startup
     {
+        private const int timeoutTicks = 600000000;
         public PlayerGroup players = new PlayerGroup();
         public JsonSerializerOptions serializerOptions = new JsonSerializerOptions
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true
         };
 
         // This method gets called by the runtime. Use this method to add services to the container.
@@ -50,7 +53,7 @@ namespace TestMmoServer
                     if (context.WebSockets.IsWebSocketRequest)
                     {
                         var socket = await context.WebSockets.AcceptWebSocketAsync();
-                        await Echo(context, socket);
+                        await RunSocket(context, socket);
                     }
                     else
                     {
@@ -64,38 +67,80 @@ namespace TestMmoServer
             });
         }
 
-        private async Task Echo(HttpContext context, WebSocket webSocket)
+        private async Task RunSocket(HttpContext context, WebSocket webSocket)
+        {
+            var playerId = await ProcessInitialMessage(webSocket);
+
+            var lastMessageTick = DateTime.UtcNow.Ticks;
+            var isConnected = true;
+            ulong messageCount = 0;
+
+            await SendGameMessage(
+                webSocket,
+                "playerid", 
+                playerId);
+
+            while (isConnected)
+            {
+                var result = await ReceiveFullMessage(webSocket, CancellationToken.None);
+
+                messageCount++;
+
+                await ProcessMessage(
+                    playerId,
+                    result.Item1.MessageType,
+                    result.Item2);
+
+                lastMessageTick = DateTime.UtcNow.Ticks;
+
+                if (result.Item1.CloseStatus.HasValue) {
+                    isConnected = false;
+                }
+
+                Console.WriteLine($"{playerId}:{messageCount}");
+            }
+            
+            await webSocket.CloseAsync(
+                WebSocketCloseStatus.NormalClosure,
+                null,
+                CancellationToken.None);
+        }
+
+        private async Task ProcessMessage(
+            string playerId,
+            WebSocketMessageType messageType,
+            byte[] bytes)
+        {
+            if (messageType != WebSocketMessageType.Text || bytes.Length == 0) {
+                return;
+            }
+
+            var stringMessage = Encoding.UTF8.GetString(bytes);
+            var gameMessages = JsonSerializer.Deserialize<GameMessage[]>(bytes, serializerOptions);
+
+            foreach (var gameMessage in gameMessages)
+            {
+                switch (gameMessage.MessageType) 
+                {
+                    case "posUpdate":
+                        players.UpdatePlayerPosition(playerId, gameMessage.XPos, gameMessage.YPos);
+                        break;
+                }
+            }
+        }
+
+        private async Task<string> ProcessInitialMessage(
+            WebSocket webSocket) 
         {
             var buffer = new byte[1024 * 4];
 
-            var result = await webSocket.ReceiveAsync(
+            var initialResult = await webSocket.ReceiveAsync(
                 new ArraySegment<byte>(buffer), 
                 CancellationToken.None);
 
             var newPlayerId = players.AddNewPlayer();
 
-            await SendGameMessage(
-                webSocket,
-                "playerid", 
-                newPlayerId);
-
-            while (!result.CloseStatus.HasValue)
-            {
-                await webSocket.SendAsync(
-                    new ArraySegment<byte>(buffer, 0, result.Count), 
-                    result.MessageType, 
-                    result.EndOfMessage, 
-                    CancellationToken.None);
-
-                result = await webSocket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer), 
-                    CancellationToken.None);
-            }
-
-            await webSocket.CloseAsync(
-                result.CloseStatus.Value, 
-                result.CloseStatusDescription, 
-                CancellationToken.None);
+            return newPlayerId;
         }
 
         private async Task SendGameMessage(
@@ -120,6 +165,24 @@ namespace TestMmoServer
                 WebSocketMessageType.Text, 
                 true,
                 CancellationToken.None);
+        }
+
+        private async Task<(WebSocketReceiveResult, byte[])> ReceiveFullMessage(
+            WebSocket socket, 
+            CancellationToken cancelToken)
+        {
+            WebSocketReceiveResult response;
+
+            var message = new List<byte>();
+
+            var buffer = new byte[4096];
+            do
+            {
+                response = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancelToken);
+                message.AddRange(new ArraySegment<byte>(buffer, 0, response.Count));
+            } while (!response.EndOfMessage);
+
+            return (response, message.ToArray());
         }
     }
 }
